@@ -113,6 +113,9 @@ type ipvsControllerController struct {
 	reloadRateLimiter flowcontrol.RateLimiter
 	keepalived        *keepalived
 	configMapName     string
+	//useService is to instruct the templating to only map the service ipaddress and not the pods
+	useService		  bool
+	
 	ruCfg             []vip
 	ruMD5             string
 
@@ -131,7 +134,7 @@ func (ipvsc *ipvsControllerController) getEndpoints(
 	s *api.Service, servicePort *api.ServicePort) []service {
 	ep, err := ipvsc.epLister.GetServiceEndpoints(s)
 	if err != nil {
-		glog.Warningf("unexpected error getting service endpoints: %v", err)
+		glog.Errorf("unexpected error getting service endpoints: %v", err)
 		return []service{}
 	}
 
@@ -176,23 +179,23 @@ func (ipvsc *ipvsControllerController) getServices(cfgMap *api.ConfigMap) []vip 
 		for _, nsSvcLvs := range strings.Split(LnsSvcLvs, "\n") {
 			ns, svc, lvsm, err := parseNsSvcLVS(nsSvcLvs)
 			if err != nil {
-				glog.Warningf("%v", err)
-				continue
+				glog.Errorf("Error parsing namespace/service entry (%q): %v", nsSvcLvs, err)
+				return []vip{}
 			}
 
 			nsSvc := fmt.Sprintf("%v/%v", ns, svc)
 			svcObj, svcExists, err := ipvsc.svcLister.Indexer.GetByKey(nsSvc)
 			if err != nil {
-				glog.Warningf("error getting service %v: %v", nsSvc, err)
-				continue
+				glog.Errorf("error getting service %v: %v", nsSvc, err)
+				return []vip{}
 			}
 
 			if !svcExists {
-				glog.Warningf("service %v not found", nsSvc)
-				continue
+				glog.Errorf("service %v not found", nsSvc)
 			}
 
 			s := svcObj.(*api.Service)
+			// we only need to map to the service layer and let k8s do the rest
 			for _, servicePort := range s.Spec.Ports {
 				ep := ipvsc.getEndpoints(s, &servicePort)
 				if len(ep) == 0 {
@@ -201,9 +204,8 @@ func (ipvsc *ipvsControllerController) getServices(cfgMap *api.ConfigMap) []vip 
 				}
 
 				if usedPort, ok := usedPorts[int(servicePort.Port)]; ok {
-					glog.Warningf("port %v of the service %v has already been allocated by the service %v",
+					glog.Errorf("port %v of the service %v has already been allocated by the service %v",
 						usedPort, s.Name, usedPorts[int(servicePort.Port)])
-					continue
 				} else {
 					usedPorts[int(servicePort.Port)] = s.Name
 				}
@@ -228,6 +230,78 @@ func (ipvsc *ipvsControllerController) getServices(cfgMap *api.ConfigMap) []vip 
 	return svcs
 }
 
+// getServices returns a list of services and their top leval infomation.
+func (ipvsc *ipvsControllerController) getServicesTop(cfgMap *api.ConfigMap) []vip {
+	svcs := []vip{}
+
+	// k -> IP to use
+	// v -> <namespace>/<service name>:<lvs method>
+	for externalIP, LnsSvcLvs := range cfgMap.Data {
+		usedPorts := map[int]string{}
+		for _, nsSvcLvs := range strings.Split(LnsSvcLvs, "\n") {
+			ns, svc, lvsm, err := parseNsSvcLVS(nsSvcLvs)
+			if err != nil {
+				glog.Errorf("Error parsing namespace/service entry (%q): %v", nsSvcLvs, err)
+				return []vip{}
+			}
+
+			nsSvc := fmt.Sprintf("%v/%v", ns, svc)
+			svcObj, svcExists, err := ipvsc.svcLister.Indexer.GetByKey(nsSvc)
+			if err != nil {
+				glog.Errorf("error getting service %v: %v", nsSvc, err)
+				return []vip{}
+			}
+
+			if !svcExists {
+				glog.Errorf("service %v not found", nsSvc)
+			}
+
+			s := svcObj.(*api.Service)
+			// we only need to map to the service layer and let k8s do the rest
+			// so for Backends we need map {{ $backend.IP }} {{ $backend.Port }}
+			//s.clusterIP
+			for _, servicePort := range s.Spec.Ports {
+				var ep []service
+				ep = append(ep, service{IP: s.Spec.ClusterIP, Port: int(servicePort.Port)})
+
+				//fmt.Println("ep : ", ep)
+				//fmt.Println("found service: ", s.Name, s.Spec.ClusterIP, servicePort.Port)
+
+				if len(ep) == 0 {
+					glog.Warningf("no endpoints found for service %v, port %+v", s.Name, servicePort)
+					continue
+				}
+
+				if usedPort, ok := usedPorts[int(servicePort.Port)]; ok {
+					glog.Errorf("port %v of the service %v has already been allocated by the service %v",
+						usedPort, s.Name, usedPorts[int(servicePort.Port)])
+				} else {
+					usedPorts[int(servicePort.Port)] = s.Name
+				}
+
+				sort.Sort(serviceByIPPort(ep))
+
+				svcs = append(svcs, vip{
+					Name:      fmt.Sprintf("%v/%v", s.Namespace, s.Name),
+					IP:        externalIP,
+					Port:      int(servicePort.Port),
+					LVSMethod: lvsm,
+					Backends:  ep,
+					Protocol:  fmt.Sprintf("%v", servicePort.Protocol),
+				})
+				
+				//fmt.Println(svcs)
+				glog.V(2).Infof("found service: %v:%v", s.Name, servicePort.Port)
+			}
+		}
+	}
+
+	sort.Sort(vipByNameIPPort(svcs))
+
+	return svcs
+}
+
+
 func (ipvsc *ipvsControllerController) getConfigMap(ns, name string) (*api.ConfigMap, error) {
 	return ipvsc.client.ConfigMaps(ns).Get(name)
 }
@@ -251,24 +325,36 @@ func (ipvsc *ipvsControllerController) sync(key string) error {
 		return fmt.Errorf("unexpected error searching configmap %v: %v", ipvsc.configMapName, err)
 	}
 
-	svc := ipvsc.getServices(cfgMap)
-	ipvsc.ruCfg = svc
-
-	err = ipvsc.keepalived.WriteCfg(svc)
-	if err != nil {
-		return err
-	}
-	glog.V(2).Infof("services: %v", svc)
-
-	md5, err := checksum(keepalivedCfg)
-	if err == nil && md5 == ipvsc.ruMD5 {
-		return nil
+	//var svc []vip
+	var svc []vip = nil
+	
+	//we change to just the TOP mark
+	if ipvsc.useService == true {
+		//fmt.Println("Using Service TOP")
+		svc = ipvsc.getServicesTop(cfgMap)
+	} else {
+		svc = ipvsc.getServices(cfgMap)
 	}
 
-	ipvsc.ruMD5 = md5
-	err = ipvsc.keepalived.Reload()
-	if err != nil {
-		glog.Errorf("error reloading keepalived: %v", err)
+	if svc != nil {
+		ipvsc.ruCfg = svc
+	
+		err = ipvsc.keepalived.WriteCfg(svc)
+		if err != nil {
+			return err
+		}
+		glog.V(2).Infof("services: %v", svc)
+	
+		md5, err := checksum(keepalivedCfg)
+		if err == nil && md5 == ipvsc.ruMD5 {
+			return nil
+		}
+	
+		ipvsc.ruMD5 = md5
+		err = ipvsc.keepalived.Reload()
+		if err != nil {
+			glog.Errorf("error reloading keepalived: %v", err)
+		}
 	}
 
 	return nil
@@ -296,12 +382,13 @@ func (ipvsc *ipvsControllerController) Stop() error {
 }
 
 // newIPVSController creates a new controller from the given config.
-func newIPVSController(kubeClient *unversioned.Client, namespace string, useUnicast bool, configMapName string, vrid int) *ipvsControllerController {
+func newIPVSController(kubeClient *unversioned.Client, namespace string, useUnicast bool, configMapName string, vrid int, useService bool) *ipvsControllerController {
 	ipvsc := ipvsControllerController{
 		client:            kubeClient,
 		reloadRateLimiter: flowcontrol.NewTokenBucketRateLimiter(reloadQPS, int(reloadQPS)),
 		ruCfg:             []vip{},
 		configMapName:     configMapName,
+		useService: 	   useService,
 		stopCh:            make(chan struct{}),
 	}
 
